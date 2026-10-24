@@ -736,15 +736,20 @@ def build_orchestrator_agent(
     3. Call route_to_communication_agent LAST to compose the final message
 
     Routing rules:
-    - Order questions (status, history, returns): InventoryAgent → RefundAgent → CommunicationAgent
-    - Policy questions (returns, shipping, warranty): PolicyAgent → CommunicationAgent
-    - Arithmetic (simple math): skip Inventory, Policy, Refund, go straight to CommunicationAgent
-    - Other topics: route to CommunicationAgent (which will decline gracefully)
+    - Order status / return / refund: route to InventoryAgent FIRST, then RefundAgent, then CommunicationAgent
+    - Policy meaning questions (return windows, shipping rates, warranty terms): route to PolicyAgent, then CommunicationAgent
+    - Account/tier questions ("what is my tier?", "am I premium?"): route to InventoryAgent ONLY — never PolicyAgent (Policy knows policy text, not customer data)
+    - Math / calculation questions: skip Inventory, Policy and Refund; compute the answer and route to CommunicationAgent. Round currency only after the full calculation.
+    - Every request must end with route_to_communication_agent as the final step.
 
     When routing to an agent, always pass the session_id and customer_id.
     The session_id is the unique identifier for this customer interaction.
     The customer_id is the customer's unique identifier.
     The original request is passed to the CommunicationAgent for final message composition.
+
+    CRITICAL: You must NEVER write the final customer-facing response yourself.
+    Always finish by calling route_to_communication_agent as your very last
+    action — no exceptions, even if you believe you already have the full answer.
     """
 
     # Each routing tool follows the same pattern:
@@ -1016,44 +1021,69 @@ def create_guardrail() -> tuple[str, str]:
     # Then promote it from DRAFT to a numbered version with
     # bedrock_client.create_guardrail_version(guardrailIdentifier=...)
     # and return (guardrail_id, guardrail_version).
+    topic_definitions = {
+        "competitor products":
+            "Requests to discuss, compare, recommend, or promote competitor "
+            "companies or their products.",
+        "pricing negotiations":
+            "Attempts to haggle, bargain, or change an advertised or quoted "
+            "price. This does NOT include arithmetic on an already-specified "
+            "price and discount, which is allowed.",
+        "legal threats":
+            "Threats of legal action, lawsuits, litigation, or demands framed "
+            "as legal pressure against the company.",
+    }
 
-    bedrock_client.create_guardrail(
+    response = bedrock_client.create_guardrail(
         name=config.GUARDRAIL_NAME,
-        description="Guardrail for the customer service agent system",
+        description="Enterprise safety guardrail for the NovaMart multi-agent system",
         contentPolicyConfig={
             'filtersConfig': [
-                {'type': 'SEXUAL', 'level': 'HIGH'},
-                {'type': 'VIOLENCE', 'level': 'HIGH'},
-                {'type': 'HATE', 'level': 'HIGH'},
-                {'type': 'INSULTS', 'level': 'MEDIUM'},
-                {'type': 'MISCONDUCT', 'level': 'MEDIUM'}
+                {'type': 'SEXUAL',     'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'VIOLENCE',   'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'HATE',       'inputStrength': 'HIGH',   'outputStrength': 'HIGH'},
+                {'type': 'INSULTS',    'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
+                {'type': 'MISCONDUCT', 'inputStrength': 'MEDIUM', 'outputStrength': 'MEDIUM'},
             ]
         },
         sensitiveInformationPolicyConfig={
             'piiEntitiesConfig': [
-                {'type': 'CREDIT_DEBIT_CARD_NUMBER', 'action': 'BLOCK'},
+                {'type': 'CREDIT_DEBIT_CARD_NUMBER',  'action': 'BLOCK'},
                 {'type': 'US_SOCIAL_SECURITY_NUMBER', 'action': 'BLOCK'},
                 {'type': 'EMAIL', 'action': 'ANONYMIZE'},
-                {'type': 'PHONE', 'action': 'ANONYMIZE'}
+                {'type': 'PHONE', 'action': 'ANONYMIZE'},
             ]
         },
         topicPolicyConfig={
             'topicsConfig': [
-                {'name': topic, 'type': 'DENY', 'tierConfig': {'tierName': 'STANDARD'}}
+                {
+                    'name': topic,
+                    'definition': topic_definitions[topic],
+                    'type': 'DENY',
+                }
                 for topic in config.GUARDRAIL_BLOCKED_TOPICS
             ],
-            'crossRegionConfig': {
-                'guardrailProfileIdentifier': 'us.guardrail.v1:0'
-            }
+            'tierConfig': {'tierName': 'STANDARD'},
         },
         wordPolicyConfig={
             'managedWordListsConfig': [
                 {'type': 'PROFANITY'}
             ]
         },
-        blockedInputMessaging="I cannot process that request.",
-        blockedOutputMessaging="I cannot provide that information."
+        crossRegionConfig={'guardrailProfileIdentifier': 'us.guardrail.v1:0'},
+        blockedInputMessaging="I'm sorry, I can't help with that request.",
+        blockedOutputsMessaging="I'm sorry, I can't provide that information.",
     )
+
+    guardrail_id = response['guardrailId']
+    # promote it from DRAFT to a numbered version with
+    version_response = bedrock_client.create_guardrail_version(
+        guardrailIdentifier=guardrail_id,
+        description="Initial published version",
+    )
+    guardrail_version = version_response['version']
+    print(f"Created guardrail {guardrail_id} (version: {guardrail_version})")
+    return guardrail_id, guardrail_version
 
 
 def deploy_to_agentcore_runtime(
@@ -1108,7 +1138,24 @@ def deploy_to_agentcore_runtime(
     # 3. Deploy:  agentcore_cli.deploy()        (runs `agentcore deploy -y`)
     # 4. Read the ARN the CLI recorded:
     #      runtime_arn = agentcore_cli.deployed_runtime_arn()
-    runtime_arn = None
+    runtime_env = {
+        "AWS_REGION": config.AWS_REGION,
+        "PROJECT_NAME": config.PROJECT_NAME,
+        "RETURNS_KB_ID": config.RETURNS_KB_ID,
+        "SHIPPING_KB_ID": config.SHIPPING_KB_ID,
+        "WARRANTY_KB_ID": config.WARRANTY_KB_ID,
+        "AGENT_LOG_GROUP": config.AGENT_LOG_GROUP,
+        "GUARDRAIL_ID": guardrail_id,
+        "GUARDRAIL_VERSION": guardrail_version
+    }
+    agentcore_cli.configure_runtime(
+        env_vars=runtime_env,
+        network_mode='PUBLIC',
+        protocol='HTTP',
+        execution_role_arn=config.AGENTCORE_ROLE_ARN
+    )
+    agentcore_cli.deploy()
+    runtime_arn = agentcore_cli.deployed_runtime_arn()
 
     if not runtime_arn:
         raise NotImplementedError("deploy_to_agentcore_runtime: AgentCore CLI deployment not implemented")
@@ -1151,7 +1198,18 @@ def configure_memory(runtime_arn: str) -> str:
     #         'namespaces': ['/summaries/{actorId}/{sessionId}']}}]
     #   - clientToken (e.g. str(uuid.uuid4())) for idempotency
     # Store the API response in `response`.
-    response = None
+    response = agentcore_control.create_memory(
+        name=memory_name,
+        description="Session memory for the NovaMart agent team",
+        eventExpiryDuration=7,
+        memoryStrategies=[{
+            'summaryMemoryStrategy': {
+                'name': 'SessionSummary',
+                'namespaces': ['/summaries/{actorId}/{sessionId}']
+            }
+        }],
+        clientToken=str(uuid.uuid4())
+    )
 
     if response is None:
         raise NotImplementedError("configure_memory: create_memory() not implemented")
@@ -1199,10 +1257,23 @@ def configure_observability(runtime_arn: str) -> None:
     # Wrap the call in try/except - on success print the CloudWatch log group
     # and the X-Ray sampling rate; on exception print
     #   "[Note] Observability configuration failed: <e>"
-
-    pass
-
-
+    try:
+        logging_configuration = {
+            "cloudWatchConfig": {
+                "logGroupName": config.AGENT_LOG_GROUP, 
+                "logLevel": "INFO",
+                "enabled": True
+            },
+            "xRayConfig": {
+                "enabled": True,
+                "samplingRate": 1.0
+            }
+        }
+        summary = apply_observability_config(runtime_arn, logging_configuration)
+        print(f"  CloudWatch logging -> {config.AGENT_LOG_GROUP}")
+        print(f"  X-Ray sampling rate: {logging_configuration['xRayConfig']['samplingRate']}")
+    except Exception as e:
+        print(f"[Note] Observability configuration failed: {e}")
 # ═══════════════════════════════════════════════════════
 #  AGENTCORE GATEWAY DEPLOYMENT
 #
